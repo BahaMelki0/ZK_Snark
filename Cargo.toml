@@ -1,0 +1,52 @@
+[package]
+name = "Semester_project"
+version = "0.1.0"
+edition = "2021"
+
+# Dependencies for the project
+[dependencies]
+# Random number generation
+rand = "0.8.5"
+nalgebra = "0.33.2" 
+
+# Cryptographic hashing
+sha2 = "0.10"
+
+# Arbitrary precision integers and serialization features
+num-bigint = { version = "0.4.6", features = ["rand", "serde"] }
+
+# Numeric traits (for Zero, One, etc.)
+num-traits = "0.2"
+
+# Serialization and deserialization support
+serde = { version = "1.0", features = ["derive", "rc"] }
+
+# AES-GCM encryption
+aes-gcm = "0.10"
+
+# Hexadecimal encoding and decoding
+hex = "0.4"
+
+# Base64 encoding and decoding
+base64 = "0.22.1"
+
+# Web server framework
+actix-web = "4"
+
+# Algebraic structures and field operations (Arkworks)
+ark-ec = "0.5.0"
+ark-poly = "0.5.0"
+ark-serialize = "0.5.0"
+ark-std = "0.5.0"
+ark-ff = "0.5.0"
+ark-bls12-381 = "0.5.0"
+ark-relations = "0.5.1"
+ark-r1cs-std = "0.5.0"
+ark-snark = "0.5.1"
+ark-bn254 = "0.5.0"
+
+# HTTP server framework (alternative to Actix)
+axum = "0.8.1"
+
+# Asynchronous runtime
+tokio = { version = "1", features = ["full"] }

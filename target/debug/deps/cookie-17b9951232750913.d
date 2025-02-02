@@ -1,0 +1,11 @@
+C:\Users\Baha\Desktop\Eurecom\Semester Project 1\Semester_project\target\debug\deps\libcookie-17b9951232750913.rmeta: C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\lib.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\builder.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\parse.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\jar.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\delta.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\draft.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\expiration.rs
+
+C:\Users\Baha\Desktop\Eurecom\Semester Project 1\Semester_project\target\debug\deps\cookie-17b9951232750913.d: C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\lib.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\builder.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\parse.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\jar.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\delta.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\draft.rs C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\expiration.rs
+
+C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\lib.rs:
+C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\builder.rs:
+C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\parse.rs:
+C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\jar.rs:
+C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\delta.rs:
+C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\draft.rs:
+C:\Users\Baha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cookie-0.16.2\src\expiration.rs:
