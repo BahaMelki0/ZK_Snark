@@ -520,28 +520,58 @@ fn commit_section4(params: &CommitmentParams, f: &VecF) -> CommitOutput {
 /// Verification of the commitment.
 fn open_section4(params: &CommitmentParams, comm: &CommitOutput) -> bool {
     let m = params.kappa * params.n;
+
+    // Check (I_{\kappa \tau} ⊗ A) ⋅ s_0 = t mod q
     let mut t_check = compute_t(params, &comm.f, m);
     if t_check.len() > 4 {
         t_check = VecF::new(t_check.data.rows_range(0..4).into_owned());
     }
-
     if t_check != comm.t {
         eprintln!("open_section4: mismatch t");
         return false;
     }
 
-    for j in 0..comm.s_arr.len() {
-        let mut sj_check = compute_s_j(params, &comm.f, j);
-        if sj_check.len() > comm.s_arr[j].len() {
-            sj_check = VecF::new(sj_check.data.rows_range(0..comm.s_arr[j].len()).into_owned());
-        }
-        if sj_check != comm.s_arr[j] {
-            eprintln!("open_section4: mismatch s_j, j={}", j);
+    // Iterate through each j and verify conditions
+    for j in 0..comm.s_arr.len() - 1 {
+        let s_j = &comm.s_arr[j];
+        let s_j1 = &comm.s_arr[j + 1];
+
+        // Compute G_{r_{j+1} \kappa n \tau} ⋅ s_j
+        let g_j = gadget_matrix(s_j.len()); // Assuming gadget_matrix() computes G
+        let g_sj = g_j.custom_mul_vec(s_j);
+
+        // Compute (I ⊗ A) ⋅ s_{j+1}
+        let i_kappa = MatF::identity(params.kappa);
+        let i_kr_a = i_kappa.kronecker_product(&params.a);
+        let a_sj1 = i_kr_a.custom_mul_vec(s_j1);
+
+        if g_sj != a_sj1 {
+            eprintln!("open_section4: mismatch in recurrence relation for j={}", j);
             return false;
         }
     }
+
+    // Check G_{r_{\ell+1} \kappa n \tau} ⋅ s_{\ell} = f mod q
+    let g_final = gadget_matrix(comm.s_arr.last().unwrap().len());
+    let g_s_l = g_final.custom_mul_vec(comm.s_arr.last().unwrap());
+
+    if g_s_l != comm.f {
+        eprintln!("open_section4: mismatch in final commitment check");
+        return false;
+    }
+
+    // Check norm constraint ||s_j|| ≤ β for all j
+    for j in 0..comm.s_arr.len() {
+        let s_j = &comm.s_arr[j];
+        if s_j.norm() > params.betas[j] {
+            eprintln!("open_section4: norm constraint failed for j={}", j);
+            return false;
+        }
+    }
+
     true
 }
+
 
 /// Prover's round function.
 fn prover_round_i(
