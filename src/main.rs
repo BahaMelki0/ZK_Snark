@@ -1,970 +1,675 @@
-use ark_bn254::Fr;
-use ark_ff::{Field, One, Zero};
-use ark_std::UniformRand;
-use rand::thread_rng;
-use rand::Rng;
-use std::fmt;
-use nalgebra::{DMatrix, DVector};
+// ZK-SNARK / Lattice Polynomial Commitment — clean implementation.
+//
+// Based on: "Polynomial Commitments from Lattices" (Cini, Malavolta, Nguyen, Wee – ePrint 2024/281).
+// Implements:
+//   • Section 4 – tree-based SIS commitment        (commit / verify_commit)
+//   • Section 5, Figure 6 – full recursive protocol (run_protocol)
+//       b₀: (I_κ ⊗ A) · y_i = t^{(i)}          (SIS commitment check)
+//       b₁: ‖y_i‖_∞ ≤ β_i                       (norm bound)
+//       b₂: (I_{κn} ⊗ x[ℓ-1-i]) · v_i = u^{(i)} (evaluation check)
+//
+// All arithmetic is i64 mod q.  No finite-field library needed.
 
-// ========================================================
-// 1) Finite Field, Vectors, and Matrices Using Arkworks and Nalgebra
-// ========================================================
+use rand::{thread_rng, Rng};
 
-// Type alias for field elements
-type F = Fr;
+// ============================================================
+// 1.  Ring arithmetic  Z_q
+// ============================================================
 
-// Vector over the finite field
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VecF {
-    pub data: DVector<F>,
+fn modq(x: i64, q: i64) -> i64 {
+    ((x % q) + q) % q
 }
 
-impl VecF {
-    pub fn new(data: DVector<F>) -> Self {
-        VecF { data }
-    }
+// ============================================================
+// 2.  Matrix / vector helpers
+// ============================================================
 
-    pub fn zero(len: usize) -> Self {
-        VecF {
-            data: DVector::from_element(len, F::zero()),
-        }
-    }
+type Vec1 = Vec<i64>;
+type Mat  = Vec<Vec<i64>>; // row-major: m[row][col]
 
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
+fn rows(m: &Mat) -> usize { m.len() }
+fn cols(m: &Mat) -> usize { m.first().map(|r| r.len()).unwrap_or(0) }
 
-    // Element-wise addition
-    pub fn add(&self, other: &Self) -> Self {
-        assert_eq!(
-            self.len(),
-            other.len(),
-            "Vector lengths must match for addition."
-        );
-        let data: Vec<F> = self
-            .data
-            .iter()
-            .zip(other.data.iter())
-            .map(|(a, b)| *a + *b)
-            .collect();
-        VecF {
-            data: DVector::from_vec(data),
-        }
-    }
+fn mat_zero(r: usize, c: usize) -> Mat { vec![vec![0i64; c]; r] }
 
-    // Element-wise multiplication
-    pub fn mul(&self, other: &Self) -> Self {
-        assert_eq!(
-            self.len(),
-            other.len(),
-            "Vector lengths must match for multiplication."
-        );
-        let data: Vec<F> = self
-            .data
-            .iter()
-            .zip(other.data.iter())
-            .map(|(a, b)| *a * *b)
-            .collect();
-        VecF {
-            data: DVector::from_vec(data),
-        }
-    }
-
-    // Scalar multiplication
-    pub fn scalar_mul(&self, scalar: F) -> Self {
-        VecF {
-            data: self.data.clone() * scalar,
-        }
-    }
-
-    /// Compute the maximum norm (max absolute value)
-    pub fn norm(&self) -> F {
-        self.data
-            .iter()
-            .cloned()
-            .fold(F::zero(), |acc, x| if x > acc { x } else { acc })
-    }
+fn eye(n: usize) -> Mat {
+    let mut m = mat_zero(n, n);
+    for i in 0..n { m[i][i] = 1; }
+    m
 }
 
-impl fmt::Display for VecF {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let elements: Vec<String> = self.data.iter().map(|x| x.to_string()).collect();
-        write!(f, "[{}]", elements.join(", "))
-    }
+fn transpose(m: &Mat) -> Mat {
+    let (r, c) = (rows(m), cols(m));
+    let mut t = mat_zero(c, r);
+    for i in 0..r { for j in 0..c { t[j][i] = m[i][j]; } }
+    t
 }
 
-// ========================================================
-// Matrix over the finite field
-// ========================================================
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MatF {
-    pub rows: usize,
-    pub cols: usize,
-    pub data: DMatrix<F>,
+/// Matrix–vector product.  q == 0 → integer arithmetic (no mod).
+fn mv(m: &Mat, v: &Vec1, q: i64) -> Vec1 {
+    let (r, c) = (rows(m), cols(m));
+    assert_eq!(c, v.len(), "mv: {}×{} · len={}", r, c, v.len());
+    (0..r).map(|i| {
+        let s: i64 = (0..c).map(|j| m[i][j] * v[j]).sum();
+        if q == 0 { s } else { modq(s, q) }
+    }).collect()
 }
 
-impl MatF {
-    /// Creates a new matrix with specified dimensions and data
-    pub fn new(rows: usize, cols: usize, data: Vec<F>) -> Self {
-        assert_eq!(
-            data.len(),
-            rows * cols,
-            "Data length ({}) must match rows * cols ({} * {}).",
-            data.len(),
-            rows,
-            cols
-        );
-        MatF {
-            rows,
-            cols,
-            data: DMatrix::from_row_slice(rows, cols, &data),
+/// A ⊗ B  (Kronecker product, pure integer — no mod)
+fn kron(a: &Mat, b: &Mat) -> Mat {
+    let (ar, ac) = (rows(a), cols(a));
+    let (br, bc) = (rows(b), cols(b));
+    let mut out = mat_zero(ar * br, ac * bc);
+    for i in 0..ar { for j in 0..ac {
+        for k in 0..br { for l in 0..bc {
+            out[i * br + k][j * bc + l] = a[i][j] * b[k][l];
+        }}
+    }}
+    out
+}
+
+/// ℓ∞ norm
+fn linf(v: &Vec1) -> i64 {
+    v.iter().map(|&x| x.abs()).max().unwrap_or(0)
+}
+
+// ============================================================
+// 3.  Gadget matrix  G_{m, α, δ}  — shape  m × (m·α)
+//
+//   Row i has δ⁰, δ¹, …, δ^{α-1} at columns i·α … (i+1)·α−1.
+//
+// G^{−1} : Z_q^m → {0,…,δ-1}^{m·α}
+//   Little-endian base-δ decomposition of each element.
+//   Satisfies  G · G^{−1}(v) = v  (mod q).
+// ============================================================
+
+fn gadget(m: usize, alpha: usize, delta: i64) -> Mat {
+    let mut g = mat_zero(m, m * alpha);
+    for i in 0..m {
+        let mut pw = 1i64;
+        for k in 0..alpha {
+            g[i][i * alpha + k] = pw;
+            pw *= delta;
         }
     }
+    g
+}
 
-    /// Creates a zero matrix of given dimensions
-    pub fn zero(rows: usize, cols: usize) -> Self {
-        MatF {
-            rows,
-            cols,
-            data: DMatrix::from_element(rows, cols, F::zero()),
-        }
-    }
-
-    /// Creates an identity matrix of given size
-    pub fn identity(size: usize) -> Self {
-        MatF {
-            rows: size,
-            cols: size,
-            data: DMatrix::identity(size, size),
-        }
-    }
-
-    /// Custom matrix-vector multiplication
-    pub fn custom_mul_vec(&self, v: &VecF) -> VecF {
-        assert_eq!(
-            self.cols,
-            v.len(),
-            "Matrix-vector multiplication dimension mismatch: matrix.cols = {}, vector.len = {}",
-            self.cols,
-            v.len()
-        );
-
-        let mut result_data = Vec::with_capacity(self.rows);
-        for r in 0..self.rows {
-            let mut sum = F::zero();
-            for c in 0..self.cols {
-                sum += self.data[(r, c)] * v.data[c];
-            }
-            result_data.push(sum);
-        }
-        VecF::new(DVector::from_vec(result_data))
-    }
-
-    /// Computes the Kronecker product of two matrices
-    pub fn kronecker_product(&self, other: &Self) -> Self {
-        let kron = self.data.kronecker(&other.data);
-        MatF {
-            rows: self.rows * other.rows,
-            cols: self.cols * other.cols,
-            data: kron,
-        }
-    }
-
-    /// Inverts a diagonal matrix (only works if matrix is diagonal)
-    pub fn inverse_diagonal(&self) -> Option<Self> {
-        if self.rows != self.cols {
-            return None;
-        }
-        let mut inv_data = DMatrix::from_element(self.rows, self.cols, F::zero());
-        for i in 0..self.rows {
-            let elem = self.data[(i, i)];
-            if elem.is_zero() {
-                return None;
-            }
-            inv_data[(i, i)] = elem.inverse().unwrap();
-        }
-        Some(MatF {
-            rows: self.rows,
-            cols: self.cols,
-            data: inv_data,
+/// G^{−1}: base-δ decomposition, output length = input.len() · α.
+fn g_inv(v: &Vec1, q: i64, delta: i64, alpha: usize) -> Vec1 {
+    v.iter().flat_map(|&x| {
+        let mut rem = modq(x, q) as u64;
+        let d = delta as u64;
+        (0..alpha).map(move |_| {
+            let b = (rem % d) as i64;
+            rem /= d;
+            b
         })
-    }
+    }).collect()
+}
 
-    /// Transposes the matrix
-    pub fn transpose(&self) -> Self {
-        MatF {
-            rows: self.cols,
-            cols: self.rows,
-            data: self.data.transpose(),
+// ============================================================
+// 4.  Scheme parameters
+//
+//   A   ∈ Z_q^{n × r·n·α}        (SIS matrix)
+//   x   = [x_0,…,x_{ℓ-1}]        evaluation vectors, each x_j ∈ Z_q^r
+//   f   ∈ Z_q^{r^ℓ · κ · n}      committed polynomial (τ = 1 throughout)
+//   t   ∈ Z_q^{κ · n}             commitment
+//   u   ∈ Z_q^{κ · n}             evaluation claim
+//   s_j ∈ Z^{r^{j+1} · κ · n · α}  opening vectors, j = 0…ℓ−1
+//
+//   Challenge  C_{i+1} ∈ {0,1}^{r·κ × κ}
+// ============================================================
+
+#[derive(Clone)]
+struct Params {
+    q:     i64,      // modulus
+    n:     usize,    // SIS matrix height
+    r:     usize,    // folding factor
+    kappa: usize,    // statistical security parameter
+    alpha: usize,    // ⌈log_δ q⌉
+    delta: i64,      // gadget base (typically 2)
+    ell:   usize,    // tree depth = number of protocol rounds
+    // betas[i] = (rκ)^i · (δ−1): ℓ∞ norm bound for y_i in round i.
+    // After i binary-matrix folds each of width rκ, the bound grows by that factor.
+    betas: Vec<i64>,
+    a:     Mat,      // n × (r·n·α)
+    // x[j] ∈ Z_q^r: evaluation row-vector for tree level j (j = 0 innermost).
+    // The committed polynomial evaluates to u at the "point" encoded by x[0..ℓ-1].
+    x:     Vec<Vec1>,
+}
+
+impl Params {
+    fn f_dim(&self) -> usize { self.r.pow(self.ell as u32) * self.kappa * self.n }
+    fn kn(&self)    -> usize { self.kappa * self.n }
+}
+
+// ============================================================
+// 5.  Evaluation witness  (used by the prover each round)
+//
+//   eval_witness(f^{(i)}, &x[0..depth], q, r)  →  v_i ∈ Z_q^{r·κ·n}
+//
+//   where depth = ℓ − i − 1.
+//
+//   The function reduces f by applying x[0] innermost first:
+//     step 0: (I_{|f|/r} ⊗ x[0]ᵀ) · f  — contracts the innermost r-block per entry
+//     step 1: same with x[1], etc.
+//   After `depth` steps the result has length r·κ·n.
+//
+//   At commit time v_0 is returned, and u = (I_{κn} ⊗ x[ℓ-1]) · v_0.
+//   On round i the prover re-derives v_i from the folded f^{(i)}.
+// ============================================================
+
+/// Reduce f (length r^{depth+1}·base) to length r·base by applying each x_j
+/// (innermost first) as a 1×r row vector.
+fn eval_witness(f: &Vec1, xs: &[Vec1], q: i64, r: usize) -> Vec1 {
+    if xs.is_empty() {
+        return f.clone();
+    }
+    // f.len() must be an exact multiple of r.
+    debug_assert_eq!(f.len() % r, 0, "eval_witness: f.len() must be divisible by r");
+    let n_out  = f.len() / r;
+    // (I_{n_out} ⊗ x_row) where x_row is a 1×r matrix
+    let x_row  = vec![xs[0].clone()];           // 1 × r
+    let kmat   = kron(&eye(n_out), &x_row);      // n_out × (n_out·r)
+    let f_next = mv(&kmat, f, q);               // length n_out
+    eval_witness(&f_next, &xs[1..], q, r)
+}
+
+// ============================================================
+// 6.  Commitment  (Section 4, eq. 2)
+//
+// Tree built bottom-up:
+//   s_{ℓ−1} = G^{−1}_{r^ℓ κ n}(f)
+//   s_j     = G^{−1}_{r^{j+1} κ n}( (I_{r^{j+1} κ} ⊗ A) · s_{j+1} )  j = ℓ−2…0
+//   t       = (I_κ ⊗ A) · s_0
+//   u       = (I_{κn} ⊗ x[ℓ-1]) · eval_witness(f, x[0..ℓ-2])
+// ============================================================
+
+#[derive(Clone)]
+struct CommitOutput {
+    t: Vec1,       // ∈ Z_q^{κn}    — SIS commitment
+    u: Vec1,       // ∈ Z_q^{κn}    — evaluation claim
+    s: Vec<Vec1>,  // s[j] ∈ Z^{r^{j+1}·κ·n·α}
+    f: Vec1,       // ∈ Z_q^{r^ℓ·κ·n}
+}
+
+fn commit(p: &Params, f: &Vec1) -> CommitOutput {
+    assert_eq!(f.len(), p.f_dim(), "commit: f must have length {}", p.f_dim());
+
+    // Build s-array bottom-up, then reverse so s[0] = s_0.
+    let mut s_rev: Vec<Vec1> = Vec::with_capacity(p.ell);
+
+    // s_{ℓ−1} = G^{−1}(f)
+    s_rev.push(g_inv(f, p.q, p.delta, p.alpha));
+
+    for step in 1..p.ell {
+        let jp1   = p.ell - step;                     // j+1 in the recurrence
+        let i_dim = p.r.pow(jp1 as u32) * p.kappa;    // size of I block
+        let kia   = kron(&eye(i_dim), &p.a);           // (i_dim·n) × (i_dim·r·n·α)
+        let prev  = s_rev.last().unwrap();
+        let tmp   = mv(&kia, prev, p.q);
+        s_rev.push(g_inv(&tmp, p.q, p.delta, p.alpha));
+    }
+    s_rev.reverse();                                   // s[0] = s_0 … s[ℓ-1] = s_{ℓ-1}
+
+    // t = (I_κ ⊗ A) · s_0
+    let ktop = kron(&eye(p.kappa), &p.a);
+    let t    = mv(&ktop, &s_rev[0], p.q);
+
+    // v_0 = eval_witness(f, x[0..ℓ-2])  reduces f to length rκn
+    let v0   = eval_witness(f, &p.x[..p.ell - 1], p.q, p.r);
+    // u = (I_{κn} ⊗ x[ℓ-1]) · v_0
+    let x_top  = vec![p.x[p.ell - 1].clone()];        // 1 × r
+    let ku_mat = kron(&eye(p.kn()), &x_top);           // κn × rκn
+    let u      = mv(&ku_mat, &v0, p.q);
+
+    CommitOutput { t, u, s: s_rev, f: f.clone() }
+}
+
+/// Verify a commitment opening.
+fn verify_commit(p: &Params, c: &CommitOutput) -> bool {
+    // 1. t = (I_κ ⊗ A) · s_0
+    if mv(&kron(&eye(p.kappa), &p.a), &c.s[0], p.q) != c.t {
+        eprintln!("verify_commit: t mismatch");
+        return false;
+    }
+    // 2. G_{r^{j+1}·κ·n} · s_j  =  (I_{r^{j+1}·κ} ⊗ A) · s_{j+1}  for j = 0..ℓ-2
+    for j in 0..p.ell - 1 {
+        let m_g  = p.r.pow((j + 1) as u32) * p.kappa * p.n;
+        let lhs  = mv(&gadget(m_g, p.alpha, p.delta), &c.s[j], p.q);
+        let i_dim = p.r.pow((j + 1) as u32) * p.kappa;
+        let rhs  = mv(&kron(&eye(i_dim), &p.a), &c.s[j + 1], p.q);
+        if lhs != rhs {
+            eprintln!("verify_commit: recurrence mismatch at j={}", j);
+            return false;
         }
     }
-}
-
-impl fmt::Display for MatF {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for r in 0..self.rows {
-            let row: Vec<String> = (0..self.cols)
-                .map(|c| self.data[(r, c)].to_string())
-                .collect();
-            writeln!(f, "[{}]", row.join(", "))?;
-        }
-        Ok(())
+    // 3. G_{r^ℓ·κ·n} · s_{ℓ-1}  =  f
+    let m_fin = p.r.pow(p.ell as u32) * p.kappa * p.n;
+    if mv(&gadget(m_fin, p.alpha, p.delta), &c.s[p.ell - 1], p.q) != c.f {
+        eprintln!("verify_commit: G·s_{{ℓ-1}} ≠ f");
+        return false;
     }
+    // 4. norm bounds: G^{-1} outputs are in {0,…,δ-1}
+    for (j, sj) in c.s.iter().enumerate() {
+        if linf(sj) >= p.delta {
+            eprintln!("verify_commit: norm exceeded at j={}", j);
+            return false;
+        }
+    }
+    true
 }
 
-// ========================================================
-// 2) Protocol Structures and Utility Functions
-// ========================================================
+// ============================================================
+// 7.  Folding protocol  (Section 5, Figure 6)
+//
+// Statement  x^{(i)} = (t^{(i)}, u^{(i)}) ∈ Z_q^{κn} × Z_q^{κn}
+// Witness    w^{(i)} = (s^{(i)}_0, …, s^{(i)}_{ℓ-i-1}, f^{(i)})
+//
+// Each round i:
+//   Prover sends  y_i = s^{(i)}_0         (SIS opening)
+//                 v_i = eval_witness(f^{(i)}, x[0..ℓ-i-2]) ∈ Z_q^{rκn}
+//
+//   Verifier checks:
+//     b₀: (I_κ ⊗ A) · y_i  =  t^{(i)}
+//     b₁: ‖y_i‖_∞ ≤ β_i
+//     b₂: (I_{κn} ⊗ x[ℓ-1-i]) · v_i  =  u^{(i)}
+//
+//   Challenge  C_{i+1} ∈ {0,1}^{rκ × κ}
+//
+//   Next statement:
+//     t^{(i+1)} = (C^T ⊗ I_n) · G_{rκn} · y_i
+//     u^{(i+1)} = (C^T ⊗ I_n) · v_i
+//
+//   Next witness:
+//     s^{(i+1)}_j = (C^T ⊗ I_{r^{j+1}·n·α}) · s^{(i)}_{j+1}  j=0…(remaining-2)
+//     f^{(i+1)}   = (C^T ⊗ I_{r^{depth-1}·n}) · f^{(i)}
+// ============================================================
 
-#[derive(Clone, Debug)]
-pub struct CommitmentParams {
-    pub q: F,               // Not used directly since F handles field operations
-    pub a: MatF,            // Matrix a
-    pub r_vals: Vec<usize>, // Vector of r values
-    pub ell: usize,         // Number of rounds
-    pub betas: Vec<F>,      // Beta values
-    pub kappa: usize,       // Parameter kappa
-    pub tau: usize,         // Parameter tau
-    pub n: usize,           // Parameter n
-}
-
-#[derive(Clone, Debug)]
-pub struct CommitOutput {
-    pub t: VecF,
-    pub s_arr: Vec<VecF>,
-    pub f: VecF,
-    pub u: VecF, // New field
+#[derive(Clone)]
+struct Statement {
+    t: Vec1,   // ∈ Z_q^{κn}
+    u: Vec1,   // ∈ Z_q^{κn}
 }
 
 #[derive(Clone)]
-pub struct Instance {
-    pub a: MatF, // Matrix a
-    pub t_i: VecF,
-    pub u_i: VecF,
+struct Witness {
+    s: Vec<Vec1>, // s[0] sent this round; drops by one each fold
+    f: Vec1,      // current folded message
 }
 
-#[derive(Clone)]
-pub struct Witness {
-    pub s_j: Vec<VecF>,
-    pub f: VecF,
+/// Uniform binary matrix in {0,1}^{rκ × κ}.
+fn sample_challenge(p: &Params) -> Mat {
+    let mut rng = thread_rng();
+    (0..p.r * p.kappa)
+        .map(|_| (0..p.kappa).map(|_| rng.gen_range(0i64..2)).collect())
+        .collect()
 }
 
-/// Minimal challenge structure.
-#[derive(Clone)]
-pub struct Challenge {
-    pub data: VecF,
+/// All three verifier checks for round `i`.
+fn verifier_ok(p: &Params, stmt: &Statement, y: &Vec1, v: &Vec1, round: usize) -> bool {
+    // b₀: (I_κ ⊗ A) · y = t
+    if mv(&kron(&eye(p.kappa), &p.a), y, p.q) != stmt.t {
+        eprintln!("b₀ failed in round {}", round);
+        return false;
+    }
+    // b₁: ‖y‖_∞ ≤ β_i
+    if linf(y) > p.betas[round] {
+        eprintln!("b₁ failed in round {} — ‖y‖_∞={} > β={}", round, linf(y), p.betas[round]);
+        return false;
+    }
+    // b₂: (I_{κn} ⊗ x[ℓ-1-i]) · v = u
+    let xi    = vec![p.x[p.ell - 1 - round].clone()]; // 1 × r
+    let kx    = kron(&eye(p.kn()), &xi);               // κn × rκn
+    if mv(&kx, v, p.q) != stmt.u {
+        eprintln!("b₂ failed in round {} — eval mismatch", round);
+        return false;
+    }
+    true
 }
 
-// ========================================================
-// 3) Protocol Functions Using Arkworks
-// ========================================================
-
-/// Pads a vector to the target length with zeros.
-fn pad_vector(v: &VecF, target_len: usize) -> VecF {
-    if v.len() >= target_len {
-        VecF::new(v.data.clone())
-    } else {
-        let zeros_to_append = target_len - v.len();
-        let zeros = DVector::from_element(zeros_to_append, F::zero());
-        let concatenated = DVector::from_iterator(
-            v.len() + zeros_to_append,
-            v.data.iter().chain(zeros.iter()).cloned(),
-        );
-        VecF::new(concatenated)
+/// Compute next statement from y_i, v_i, and challenge C.
+///   t^{(i+1)} = (C^T ⊗ I_n) · G_{rκn} · y_i
+///   u^{(i+1)} = (C^T ⊗ I_n) · v_i
+fn next_statement(p: &Params, y: &Vec1, v: &Vec1, c: &Mat) -> Statement {
+    let ct   = transpose(c);                                         // κ × rκ
+    let kct  = kron(&ct, &eye(p.n));                                 // κn × rκn
+    let m    = p.r * p.kappa * p.n;
+    let gy   = mv(&gadget(m, p.alpha, p.delta), y, p.q);            // rκn
+    Statement {
+        t: mv(&kct, &gy, p.q),
+        u: mv(&kct, v,  p.q),
     }
 }
 
-/// Generates a diagonal gadget matrix with powers of two on the diagonal.
-fn gadget_matrix(m: usize) -> MatF {
-    let mut data = Vec::with_capacity(m * m);
-    for r in 0..m {
-        for c in 0..m {
-            if r == c {
-                // Compute 2^r in field F
-                let val = F::from(2u64).pow(&[r as u64, 0, 0, 0]);
-                data.push(val);
-            } else {
-                data.push(F::zero());
-            }
-        }
-    }
-    let matrix = MatF::new(m, m, data);
-    println!("DEBUG: Gadget matrix (size {}x{}):\n{}", m, m, matrix);
-    matrix
-}
+/// Fold the witness.  `depth` = rounds still remaining (including this one).
+fn next_witness(p: &Params, w: &Witness, c: &Mat, depth: usize) -> Witness {
+    let ct = transpose(c); // κ × rκ
 
-/// Applies the inverse of the gadget matrix to vector v
-/// and returns the binary representation as a vector whose
-/// entries are exactly 0 or 1 (encoded as elements of F).
-fn g_inv_apply(_params: &CommitmentParams, v: &VecF, m: usize) -> VecF {
-    let gadget = gadget_matrix(m);
-    println!("DEBUG: Gadget matrix (before inversion):\n{}", gadget);
-
-    let gadget_inv = gadget
-        .inverse_diagonal()
-        .expect("Gadget matrix is invertible.");
-    println!("DEBUG: Inverted gadget matrix:\n{}", gadget_inv);
-
-    let adjusted_v = if v.len() > gadget_inv.cols {
-        println!(
-            "DEBUG: Truncating vector v from length {} to {}",
-            v.len(),
-            gadget_inv.cols
-        );
-        VecF::new(v.data.rows_range(0..gadget_inv.cols).into_owned())
-    } else if v.len() < gadget_inv.cols {
-        println!(
-            "DEBUG: Padding vector v from length {} to {}",
-            v.len(),
-            gadget_inv.cols
-        );
-        pad_vector(v, gadget_inv.cols)
-    } else {
-        v.clone()
-    };
-    println!("DEBUG: Adjusted v: {}", adjusted_v);
-
-    let decoded = gadget_inv.custom_mul_vec(&adjusted_v);
-    println!("DEBUG: Decoded (pre-rounding) vector: {}", decoded);
-
-    let binary_data: Vec<F> = decoded.data.iter().map(|x| {
-        if *x == F::zero() {
-            F::zero()
-        } else if *x == F::one() {
-            F::one()
-        } else {
-            panic!("Non-binary value encountered in g_inv_apply: {}", x)
-        }
+    // s^{(i+1)}_j = (C^T ⊗ I_{r^{j+1}·n·α}) · s^{(i)}_{j+1}
+    let new_s: Vec<Vec1> = (0..w.s.len() - 1).map(|j| {
+        let blk = p.r.pow((j + 1) as u32) * p.n * p.alpha;
+        mv(&kron(&ct, &eye(blk)), &w.s[j + 1], 0) // integer arithmetic
     }).collect();
 
-    let binary_vec = VecF::new(DVector::from_vec(binary_data));
-    println!("DEBUG: Binary representation (g_inv_apply result): {}", binary_vec);
-    binary_vec
+    // f^{(i+1)} = (C^T ⊗ I_{r^{depth-1}·n}) · f^{(i)}
+    let fblk  = p.r.pow((depth - 1) as u32) * p.n;
+    let new_f = mv(&kron(&ct, &eye(fblk)), &w.f, p.q);
+
+    Witness { s: new_s, f: new_f }
 }
 
-/// Constructs the challenge matrix \( C_{i+1} \) as a column vector (dim × 1 matrix).
-fn construct_ct(challenge: &Challenge, dim: usize, _a: &MatF) -> MatF {
-    assert_eq!(
-        challenge.data.len(),
-        dim,
-        "Challenge length must be exactly {} (got {})",
-        dim,
-        challenge.data.len()
-    );
-    MatF::new(dim, 1, challenge.data.data.iter().cloned().collect())
-}
+/// Run all ℓ rounds.  Returns true iff every round passes all three checks.
+fn run_protocol(p: &Params, comm: &CommitOutput) -> bool {
+    let mut stmt = Statement { t: comm.t.clone(), u: comm.u.clone() };
+    let mut wit  = Witness   { s: comm.s.clone(), f: comm.f.clone() };
 
-/// Generates a diagonal gadget matrix with powers of two on the diagonal.
-/// The size of the matrix is `kappa * n` to align with protocol parameters.
-fn generate_xj(_j: usize, kappa: usize, n: usize) -> MatF {
-    let size = kappa * n;
-    gadget_matrix(size)
-}
+    for i in 0..p.ell {
+        let depth = p.ell - i;
 
-/// Computes t_i by first decoding f to obtain y_i and then computing
-/// t_i = (I_{m/kappa} ⊗ a) * y_i.
-fn compute_t(params: &CommitmentParams, f: &VecF, m: usize) -> VecF {
-    println!("Running compute_t");
+        // Prover computes both messages.
+        let y = wit.s[0].clone();
+        // eval_witness reduces f^{(i)} (length rκn · r^{depth-1}) to rκn.
+        // Inner levels consumed: depth-1 evaluation vectors x[0..depth-2].
+        let v = eval_witness(&wit.f, &p.x[..depth - 1], p.q, p.r);
 
-    let y_i = g_inv_apply(params, f, m);
-    println!("DEBUG: y_i = {}", y_i);
-
-    let i_kappa_size = m / params.kappa;
-    let i_kappa = MatF::identity(i_kappa_size);
-    let tensor_i_kr_a = i_kappa.kronecker_product(&params.a);
-    println!(
-        "DEBUG: Kronecker product (I_{{m/kappa}} ⊗ a) dimensions: {}x{}",
-        tensor_i_kr_a.rows, tensor_i_kr_a.cols
-    );
-
-    assert_eq!(
-        y_i.len(),
-        tensor_i_kr_a.cols,
-        "y_i length ({}) must match tensor_i_kr_a.cols ({})",
-        y_i.len(),
-        tensor_i_kr_a.cols
-    );
-
-    let t_i = tensor_i_kr_a.custom_mul_vec(&y_i);
-    println!("DEBUG: Computed t_i = {}", t_i);
-
-    t_i
-}
-
-/// Computes u based on parameters and f (similar to compute_t).
-fn compute_u(params: &CommitmentParams, f: &VecF) -> VecF {
-    println!("Running compute_u");
-
-    let m = params.kappa * params.n;
-    let y_i = g_inv_apply(params, f, m);
-    println!("DEBUG: y_i for u = {}", y_i);
-
-    let i_kappa_size = m / params.kappa;
-    let i_kappa = MatF::identity(i_kappa_size);
-    let tensor_i_kr_a = i_kappa.kronecker_product(&params.a);
-    println!(
-        "DEBUG: Kronecker product (I_{{m/kappa}} ⊗ a) for u dimensions: {}x{}",
-        tensor_i_kr_a.rows, tensor_i_kr_a.cols
-    );
-
-    assert_eq!(
-        y_i.len(),
-        tensor_i_kr_a.cols,
-        "y_i length ({}) must match tensor_i_kr_a.cols ({}) for u",
-        y_i.len(),
-        tensor_i_kr_a.cols
-    );
-
-    let u_i = tensor_i_kr_a.custom_mul_vec(&y_i);
-    println!("DEBUG: Computed u_i = {}", u_i);
-
-    u_i
-}
-
-/// Computes s_j based on the current parameters, f, and j.
-/// In this version we compute the encoded s_j and then decode it block‑wise.
-fn compute_s_j(params: &CommitmentParams, f: &VecF, j: usize) -> VecF {
-    println!("Running compute_s_j");
-
-    let x_li = generate_xj(j, params.kappa, params.n);
-    println!("DEBUG: Generated x_li for compute_s_j:\n{}", x_li);
-
-    let i_kappa = MatF::identity(params.kappa);
-    let tensor_i_kappa_x_li = i_kappa.kronecker_product(&x_li);
-    println!(
-        "DEBUG: Kronecker product (I_{{kappa}} ⊗ X_li) dimensions: {}x{}",
-        tensor_i_kappa_x_li.rows, tensor_i_kappa_x_li.cols
-    );
-
-    // Adjust f to match the required column dimension.
-    let f_padded = if f.len() < tensor_i_kappa_x_li.cols {
-        println!(
-            "DEBUG: Padding f from {} to {} to match tensor_i_kappa_x_li.cols",
-            f.len(),
-            tensor_i_kappa_x_li.cols
-        );
-        pad_vector(f, tensor_i_kappa_x_li.cols)
-    } else if f.len() > tensor_i_kappa_x_li.cols {
-        println!(
-            "DEBUG: Truncating f from {} to {} to match tensor_i_kappa_x_li.cols",
-            f.len(),
-            tensor_i_kappa_x_li.cols
-        );
-        VecF::new(f.data.rows_range(0..tensor_i_kappa_x_li.cols).into_owned())
-    } else {
-        f.clone()
-    };
-    println!("DEBUG: f_padded for s_j: {}", f_padded);
-
-    // Compute the encoded s_j.
-    let s_encoded = tensor_i_kappa_x_li.custom_mul_vec(&f_padded);
-    println!("DEBUG: Encoded s_j computed: {}", s_encoded);
-
-    // Decode s_encoded block-wise.
-    let block_len = f_padded.len() / params.kappa;
-    let mut decoded_data = Vec::new();
-    for block in 0..params.kappa {
-        let start = block * block_len;
-        let end = start + block_len;
-        let block_vec = VecF::new(s_encoded.data.rows_range(start..end).into_owned());
-        println!("DEBUG: s_encoded block {}: {}", block, block_vec);
-        let decoded_block = g_inv_apply(params, &block_vec, block_len);
-        println!("DEBUG: Decoded block {}: {}", block, decoded_block);
-        // Extend with owned copies of the field elements.
-        decoded_data.extend(decoded_block.data.iter().cloned());
-    }
-    let s_binary = VecF::new(DVector::from_vec(decoded_data));
-    println!("DEBUG: Full decoded s_j (binary): {}", s_binary);
-
-    // Optionally truncate if needed (here we truncate each block to 4 elements, if desired)
-    let s_final = if s_binary.len() > params.kappa * 4 {
-        println!("DEBUG: Truncating s_j binary to {} elements", params.kappa * 4);
-        VecF::new(s_binary.data.rows_range(0..params.kappa * 4).into_owned())
-    } else {
-        s_binary
-    };
-    println!("DEBUG: Final s_j: {}", s_final);
-    s_final
-}
-
-/// Commitment function.
-fn commit_section4(params: &CommitmentParams, f: &VecF) -> CommitOutput {
-    let m = params.kappa * params.n;
-    let mut t_full = compute_t(params, f, m);
-    if t_full.len() > 4 {
-        println!("DEBUG: Truncating t from {} to 4", t_full.len());
-        t_full = VecF::new(t_full.data.rows_range(0..4).into_owned());
-    }
-
-    let mut u_full = compute_u(params, f);
-    if u_full.len() > 4 {
-        println!("DEBUG: Truncating u from {} to 4", u_full.len());
-        u_full = VecF::new(u_full.data.rows_range(0..4).into_owned());
-    }
-
-    let mut s_arr = Vec::new();
-    for j in 0..params.ell {
-        let s = compute_s_j(params, f, j);
-        s_arr.push(s);
-    }
-
-    CommitOutput {
-        t: t_full,
-        s_arr,
-        f: f.clone(),
-        u: u_full,
-    }
-}
-
-/// Verification of the commitment.
-fn open_section4(params: &CommitmentParams, comm: &CommitOutput) -> bool {
-    let m = params.kappa * params.n;
-
-    // Check (I_{\kappa \tau} ⊗ A) ⋅ s_0 = t mod q
-    let mut t_check = compute_t(params, &comm.f, m);
-    if t_check.len() > 4 {
-        t_check = VecF::new(t_check.data.rows_range(0..4).into_owned());
-    }
-    if t_check != comm.t {
-        eprintln!("open_section4: mismatch t");
-        return false;
-    }
-
-    // Iterate through each j and verify conditions
-    for j in 0..comm.s_arr.len() - 1 {
-        let s_j = &comm.s_arr[j];
-        let s_j1 = &comm.s_arr[j + 1];
-
-        // Compute G_{r_{j+1} \kappa n \tau} ⋅ s_j
-        let g_j = gadget_matrix(s_j.len()); // Assuming gadget_matrix() computes G
-        let g_sj = g_j.custom_mul_vec(s_j);
-
-        // Compute (I ⊗ A) ⋅ s_{j+1}
-        let i_kappa = MatF::identity(params.kappa);
-        let i_kr_a = i_kappa.kronecker_product(&params.a);
-        let a_sj1 = i_kr_a.custom_mul_vec(s_j1);
-
-        if g_sj != a_sj1 {
-            eprintln!("open_section4: mismatch in recurrence relation for j={}", j);
+        if !verifier_ok(p, &stmt, &y, &v, i) {
             return false;
         }
-    }
 
-    // Check G_{r_{\ell+1} \kappa n \tau} ⋅ s_{\ell} = f mod q
-    let g_final = gadget_matrix(comm.s_arr.last().unwrap().len());
-    let g_s_l = g_final.custom_mul_vec(comm.s_arr.last().unwrap());
-
-    if g_s_l != comm.f {
-        eprintln!("open_section4: mismatch in final commitment check");
-        return false;
-    }
-
-    // Check norm constraint ||s_j|| ≤ β for all j
-    for j in 0..comm.s_arr.len() {
-        let s_j = &comm.s_arr[j];
-        if s_j.norm() > params.betas[j] {
-            eprintln!("open_section4: norm constraint failed for j={}", j);
-            return false;
+        if i < p.ell - 1 {
+            let c = sample_challenge(p);
+            stmt  = next_statement(p, &y, &v, &c);
+            wit   = next_witness(p, &wit, &c, depth);
         }
     }
-
     true
 }
 
+// ============================================================
+// 8.  Helpers
+// ============================================================
 
-/// Prover's round function.
-fn prover_round_i(
-    params: &CommitmentParams,
-    _x_i: &Instance,
-    w_i: &Witness,
-    _i: usize,
-) -> VecF {
-    println!("Running prover_round_i");
-
-    let y_i = w_i.s_j[0].clone();
-    let v_i = w_i.f.clone();
-
-    let concatenated = DVector::from_iterator(
-        y_i.data.len() + v_i.data.len(),
-        y_i.data.iter().chain(v_i.data.iter()).cloned(),
-    );
-    VecF::new(concatenated)
-}
-
-/// Verifier's round function.
-fn verifier_round_i(
-    params: &CommitmentParams,
-    x_i: &Instance,
-    z_i: &VecF,
-    c_i: &Challenge,
-    _i: usize,
-) -> bool {
-    println!("\n=== Verifier Round {} ===", _i + 1);
-
-    let r_i = params.r_vals[params.ell - _i - 1];
-    println!("DEBUG: Current r_i = {}", r_i);
-
-    let y_i_len = params.kappa * r_i;
-    let y_i = VecF::new(z_i.data.rows_range(0..y_i_len).into_owned());
-    let v_i = VecF::new(z_i.data.rows_range(y_i_len..).into_owned());
-
-    println!("DEBUG: Extracted y_i = {}", y_i);
-    println!("DEBUG: Extracted v_i = {}", v_i);
-
-    // Check b_i,0: c_i * (G * y_i) == t_i
-    let g = gadget_matrix(y_i.len());
-    println!("DEBUG: Gadget matrix for b_i,0:\n{}", g);
-
-    let g_y_i = g.custom_mul_vec(&y_i);
-    println!("DEBUG: G * y_i = {}", g_y_i);
-
-    assert_eq!(
-        c_i.data.len(),
-        g_y_i.len(),
-        "Challenge length ({}) does not match G * y_i length ({})",
-        c_i.data.len(),
-        g_y_i.len()
-    );
-    let t_check = g_y_i.mul(&c_i.data);
-    println!("DEBUG: Computed t_check = {}", t_check);
-
-    let t_expected = x_i.t_i.clone();
-    println!("DEBUG: Expected t_i = {}", t_expected);
-
-    if t_check != VecF::new(t_expected.data.rows_range(0..4).into_owned()) {
-        println!("DEBUG: b_i,0 check failed.");
-        return false;
-    } else {
-        println!("DEBUG: b_i,0 check passed.");
-    }    
-
-    // Check b_i,1: (I_{kappa} ⊗ X_li) ⋅ v_i == u_i
-    let x_li = generate_xj(params.ell - _i - 1, params.kappa, params.n);
-    println!("DEBUG: Generated x_li matrix:\n{}", x_li);
-
-    let i_kappa = MatF::identity(params.kappa);
-    println!(
-        "DEBUG: Identity matrix i_kappa (size {}x{})\n{}",
-        params.kappa,
-        params.kappa,
-        i_kappa
-    );
-
-    let tensor_i_kappa_x_li = i_kappa.kronecker_product(&x_li);
-    println!(
-        "DEBUG: Kronecker product (I_{{kappa}} ⊗ X_li) dimensions: {}x{}",
-        tensor_i_kappa_x_li.rows, tensor_i_kappa_x_li.cols
-    );
-
-    let mut v_i_padded = v_i.clone();
-    if v_i.len() != tensor_i_kappa_x_li.cols {
-        if v_i.len() < tensor_i_kappa_x_li.cols {
-            println!(
-                "DEBUG: Padding v_i from {} to {} to match tensor_i_kappa_x_li.cols",
-                v_i.len(),
-                tensor_i_kappa_x_li.cols
-            );
-            v_i_padded = pad_vector(&v_i, tensor_i_kappa_x_li.cols);
-        } else {
-            println!(
-                "DEBUG: Truncating v_i from {} to {} to match tensor_i_kappa_x_li.cols",
-                v_i.len(),
-                tensor_i_kappa_x_li.cols
-            );
-            v_i_padded = VecF::new(
-                v_i.data
-                    .rows_range(0..tensor_i_kappa_x_li.cols)
-                    .into_owned(),
-            );
-        }
-    }
-    println!("DEBUG: Adjusted v_i for b_i,1:\n{}", v_i_padded);
-
-    let u_check = tensor_i_kappa_x_li.custom_mul_vec(&v_i_padded);
-    println!("DEBUG: Computed u_check = {}", u_check);
-
-    let u_expected = x_i.u_i.clone();
-    println!("DEBUG: Expected u_i = {}", u_expected);
-
-    if u_check != u_expected {
-        println!("DEBUG: b_i,1 check failed.");
-        return false;
-    } else {
-        println!("DEBUG: b_i,1 check passed.");
-    }
-
-    // Check b_i,2: Norm constraints
-    let beta_li = params.betas[params.ell - _i - 1];
-    let y_norm = y_i.norm();
-    let v_norm = v_i.norm();
-
-    let epsilon = F::from(1u64);
-
-    println!(
-        "DEBUG: Norm check: y_norm = {}, v_norm = {}, beta = {}, epsilon = {}",
-        y_norm, v_norm, beta_li, epsilon
-    );
-
-    if y_norm > (beta_li + epsilon) || v_norm > (beta_li + epsilon) {
-        println!("DEBUG: Norm constraints failed.");
-        return false;
-    } else {
-        println!("DEBUG: Norm constraints passed.");
-    }
-
-    println!("DEBUG: verifier_round_i passed.");
-    true
-}
-
-/// Generates a random challenge vector.
-fn sample_challenge(dim: usize) -> Challenge {
+fn rand_vec(n: usize, q: i64) -> Vec1 {
     let mut rng = thread_rng();
-    let mut d = Vec::with_capacity(dim);
-    for _ in 0..dim {
-        let r = F::rand(&mut rng);
-        d.push(r);
-    }
-    Challenge {
-        data: VecF::new(DVector::from_vec(d)),
-    }
+    (0..n).map(|_| rng.gen_range(0..q)).collect()
 }
 
-/// In this fixed version we generate a binary vector and gadget-encode it.
-fn generate_random_f(dim: usize) -> VecF {
-    let mut rng = thread_rng();
-    let mut bits = Vec::with_capacity(dim);
-    for _ in 0..dim {
-        let bit: u64 = rng.gen_range(0..2);
-        bits.push(F::from(bit));
-    }
-    let b_vec = VecF::new(DVector::from_vec(bits));
-    println!("DEBUG: Generated binary vector: {}", b_vec);
-    let gadget = gadget_matrix(dim);
-    let f = gadget.custom_mul_vec(&b_vec);
-    println!("DEBUG: Gadget-encoded f: {}", f);
-    f
+fn make_params(ell: usize) -> Params {
+    // Toy parameters: q=8, δ=2, α=3 (2³=8=q), n=2, r=2, κ=1.
+    let q = 8i64; let delta = 2i64; let alpha = 3;
+    let n = 2; let r = 2; let kappa = 1;
+    // Fixed A for reproducibility.
+    let a_cols = r * n * alpha; // 12
+    let a: Mat = (0..n)
+        .map(|i| (0..a_cols).map(|j| ((i + j) as i64) % q).collect())
+        .collect();
+    // β_i = (rκ)^i · (δ−1)
+    let betas: Vec<i64> = (0..ell)
+        .map(|i| (r as i64 * kappa as i64).pow(i as u32) * (delta - 1))
+        .collect();
+    // Evaluation vectors x[j] ∈ Z_q^r.
+    // Using x[j] = [1, z^{2^j}] with z = 3 gives a concrete multilinear evaluation point.
+    let z = 3i64;
+    let x: Vec<Vec1> = (0..ell)
+        .map(|j| {
+            let zj = modq(z.pow(j as u32), q);
+            (0..r).map(|k| modq(zj.pow(k as u32), q)).collect()
+        })
+        .collect();
+    Params { q, n, r, kappa, alpha, delta, ell, betas, a, x }
 }
 
-fn next_instance(
-    x_i: &Instance,
-    z_i: &VecF,
-    c: &Challenge,
-    params: &CommitmentParams,
-    _i: usize,
-) -> Instance {
-    let r_i = params.r_vals[params.ell - _i - 1];
-    let y_i_len = params.kappa * r_i;
-    let y_i = VecF::new(z_i.data.rows_range(0..y_i_len).into_owned());
-    let v_i = VecF::new(z_i.data.rows_range(y_i_len..).into_owned());
-    
-    let c_t = construct_ct(c, y_i.len(), &x_i.a);
-    let g = gadget_matrix(y_i.len());
-    let g_y_i = g.custom_mul_vec(&y_i);
-    let c_t_vec = VecF::new(c_t.data.column(0).into_owned());
+// ============================================================
+// 9.  Main — demo
+// ============================================================
 
-    println!("DEBUG: c_t_vec.len() = {}", c_t_vec.len());
-    println!("DEBUG: g_y_i.len() = {}", g_y_i.len());
-
-    let t_next = c_t_vec.mul(&g_y_i);
-    println!("DEBUG: t_next = {}", t_next);
-
-    let mut u_next = DVector::zeros(v_i.len());
-    let block_size = c_t_vec.len();
-
-    for block in 0..params.kappa {
-        let start = block * block_size;
-        let end = start + block_size;
-        let v_block = v_i.data.rows_range(start..end).into_owned();
-        let v_block_vec = VecF::new(v_block);
-
-        assert_eq!(
-            v_block_vec.len(),
-            c_t_vec.len(),
-            "v_block_vec.len() ({}) does not match c_t_vec.len() ({})",
-            v_block_vec.len(),
-            c_t_vec.len()
-        );
-
-        let updated_block = c_t_vec.mul(&v_block_vec);
-        println!("DEBUG: updated_block u_i[{}..{}] = {}", start, end, updated_block);
-        u_next.rows_range_mut(start..end).copy_from(&updated_block.data);
-    }
-
-    let u_next_vec = VecF::new(u_next);
-    println!("DEBUG: u_next = {}", u_next_vec);
-
-    Instance {
-        a: x_i.a.clone(),
-        t_i: t_next,
-        u_i: u_next_vec,
-    }
-}
-
-fn next_witness(params: &CommitmentParams, w_i: &Witness, c: &Challenge) -> Witness {
-    let mut new_sj = Vec::new();
-
-    for j in 0..w_i.s_j.len() {
-        let c_t = construct_ct(c, w_i.s_j[j].len(), &params.a);
-        let r_scale = params.kappa;
-        let i = MatF::identity(r_scale);
-        let c_t_transposed = c_t.transpose();
-
-        println!(
-            "DEBUG: c_t_transposed dimensions: {}x{}",
-            c_t_transposed.rows, c_t_transposed.cols
-        );
-        println!("DEBUG: s_j[j].len() = {}", w_i.s_j[j].len());
-
-        assert_eq!(
-            c_t_transposed.cols,
-            i.cols,
-            "c_t_transposed.cols ({}) does not match i.cols ({})",
-            c_t_transposed.cols,
-            i.cols
-        );
-
-        let updated_sj = c_t_transposed.kronecker_product(&i).custom_mul_vec(&w_i.s_j[j]);
-        println!("DEBUG: updated_sj = {}", updated_sj);
-        new_sj.push(updated_sj);
-    }
-
-    let c_t = construct_ct(c, w_i.f.len() / params.kappa, &params.a);
-    let r_scale_f = params.kappa;
-    let i_f = MatF::identity(r_scale_f);
-
-    println!(
-        "DEBUG: c_t dimensions for f update: {}x{}",
-        c_t.rows, c_t.cols
-    );
-    println!("DEBUG: i_f dimensions: {}x{}", i_f.rows, i_f.cols);
-
-    let c_t_vec: VecF = VecF::new(c_t.data.column(0).into_owned());
-
-    println!("DEBUG: c_t_vec.len() = {}", c_t_vec.len());
-    println!("DEBUG: w_i.f.len() = {}", w_i.f.len());
-
-    let mut updated_f = DVector::zeros(w_i.f.len());
-    let block_size = c_t_vec.len();
-
-    for block in 0..params.kappa {
-        let start = block * block_size;
-        let end = start + block_size;
-        let f_block = w_i.f.data.rows_range(start..end).into_owned();
-        let f_block_vec = VecF::new(f_block);
-
-        assert_eq!(
-            f_block_vec.len(),
-            c_t_vec.len(),
-            "f_block_vec.len() ({}) does not match c_t_vec.len() ({})",
-            f_block_vec.len(),
-            c_t_vec.len()
-        );
-
-        let updated_block = c_t_vec.mul(&f_block_vec);
-        println!("DEBUG: updated_block[{}..{}] = {}", start, end, updated_block);
-        updated_f.rows_range_mut(start..end).copy_from(&updated_block.data);
-    }
-
-    println!("DEBUG: updated_f = {}", VecF::new(updated_f.clone()));
-
-    Witness {
-        s_j: new_sj,
-        f: VecF::new(updated_f),
-    }
-}
-
-/// Open_poly returns true if all checks pass.
-fn open_poly(params: &CommitmentParams, comm: &CommitOutput, rounds: usize) -> bool {
-    let base_ok = open_section4(params, comm);
-    if !base_ok {
-        return false;
-    }
-
-    let mut x_i = Instance {
-        a: params.a.clone(),
-        t_i: comm.t.clone(),
-        u_i: comm.u.clone(),
-    };
-
-    println!("DEBUG: Initializing instance x_i");
-    println!("DEBUG: x_i.a =\n{}", params.a);
-    println!("DEBUG: x_i.t_i = {}", comm.t);
-    println!("DEBUG: x_i.u_i = {}", x_i.u_i);
-
-    let mut w_i = Witness {
-        s_j: comm.s_arr.clone(),
-        f: comm.f.clone(),
-    };
-
-    for i in 0..rounds {
-        println!("=== Round {} ===", i + 1);
-
-        let z_i = prover_round_i(params, &x_i, &w_i, i);
-        println!("Prover's z_i: {}", z_i);
-
-        let r_i = params.r_vals[params.ell - i - 1];
-        println!("DEBUG: Current r_i for round {}: {}", i + 1, r_i);
-
-        let c = sample_challenge(params.kappa * r_i);
-        println!("Verifier's challenge (len={}): {}", c.data.len(), c.data);
-
-        let ok = verifier_round_i(params, &x_i, &z_i, &c, i);
-        if !ok {
-            eprintln!("open_poly: Verification failed in round {}", i + 1);
-            return false;
-        }
-
-        x_i = next_instance(&x_i, &z_i, &c, params, i);
-        w_i = next_witness(params, &w_i, &c);
-    }
-
-    true
-}
-
-/// In this fixed version we generate a binary vector and gadget-encode it.
 fn main() {
-    println!("=== Demo: ZK Proof System with Arkworks ===");
+    println!("=== Lattice Polynomial Commitment Demo ===");
 
-    let a = MatF::identity(2);
+    let p = make_params(2);
+    let f = rand_vec(p.f_dim(), p.q);
 
-    let params = CommitmentParams {
-        q: F::one(),
-        a: a.clone(),
-        r_vals: vec![4, 2],
-        ell: 2,
-        betas: vec![
-            F::from(1_800_000_000_000_000_000u64),
-            F::from(1_800_000_000_000_000_000u64),
-        ],
-        kappa: 2,
-        tau: 1,
-        n: 4,
-    };
+    println!("n={} r={} κ={} α={} δ={} ℓ={} q={}", p.n, p.r, p.kappa, p.alpha, p.delta, p.ell, p.q);
+    println!("eval points x = {:?}", p.x);
+    println!("f (len={})  = {:?}", f.len(), f);
 
-    let fdim = params.kappa * params.n;
-    let f_vec = generate_random_f(fdim);
+    let comm = commit(&p, &f);
+    println!("t = {:?}", comm.t);
+    println!("u = {:?}", comm.u);
 
-    println!("Generated f (gadget-encoded): {}", f_vec);
+    let ok_commit = verify_commit(&p, &comm);
+    println!("verify_commit → {}", ok_commit);
 
-    let comm_out = commit_section4(&params, &f_vec);
-    println!(
-        "commit => t.len={}, s_arr.len={}, u.len={}",
-        comm_out.t.len(),
-        comm_out.s_arr.len(),
-        comm_out.u.len()
-    );
+    let ok_proto = run_protocol(&p, &comm);
+    println!("run_protocol  → {}", ok_proto);
 
-    let w_i = Witness {
-        s_j: comm_out.s_arr.clone(),
-        f: comm_out.f.clone(),
-    };
+    if ok_commit && ok_proto { println!("All checks passed."); }
+    else { eprintln!("FAILURE."); }
+}
 
-    let protocol_success = open_poly(&params, &comm_out, params.ell);
+// ============================================================
+// 10.  Tests
+// ============================================================
 
-    if protocol_success && open_section4(&params, &comm_out) {
-        println!("Protocol result => true");
-    } else {
-        println!("Protocol result => false");
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── gadget primitives ──────────────────────────────────────
+
+    #[test]
+    fn gadget_structure_2_3_2() {
+        let g = gadget(2, 3, 2);
+        assert_eq!(g[0], vec![1, 2, 4, 0, 0, 0]);
+        assert_eq!(g[1], vec![0, 0, 0, 1, 2, 4]);
+    }
+
+    #[test]
+    fn g_inv_roundtrip() {
+        let p = make_params(1);
+        for &x in &[0i64, 1, 3, 5, 7] {
+            let d    = g_inv(&vec![x], p.q, p.delta, p.alpha);
+            let back = mv(&gadget(1, p.alpha, p.delta), &d, p.q);
+            assert_eq!(back[0], modq(x, p.q), "roundtrip failed for x={}", x);
+        }
+    }
+
+    #[test]
+    fn g_inv_multi() {
+        let p = make_params(1);
+        let v    = vec![0i64, 3, 6, 7];
+        let d    = g_inv(&v, p.q, p.delta, p.alpha);
+        let back = mv(&gadget(v.len(), p.alpha, p.delta), &d, p.q);
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn g_inv_digits_in_range() {
+        let p = make_params(1);
+        for digit in g_inv(&rand_vec(8, p.q), p.q, p.delta, p.alpha) {
+            assert!(digit >= 0 && digit < p.delta);
+        }
+    }
+
+    // ── eval_witness ──────────────────────────────────────────
+
+    #[test]
+    fn eval_witness_ell1_trivial() {
+        // depth = 0: eval_witness(f, &[], ...) = f
+        let p = make_params(1);
+        let f = rand_vec(p.r * p.kn(), p.q);
+        let v = eval_witness(&f, &[], p.q, p.r);
+        assert_eq!(v, f);
+    }
+
+    #[test]
+    fn eval_witness_ell2_dimension() {
+        // depth = 1: f ∈ Z_q^{r²κn}, v ∈ Z_q^{rκn}
+        let p  = make_params(2);
+        let f  = rand_vec(p.f_dim(), p.q);           // r²κn = 8
+        let v0 = eval_witness(&f, &p.x[..1], p.q, p.r); // consume x[0]
+        assert_eq!(v0.len(), p.r * p.kn());           // rκn = 4
+    }
+
+    #[test]
+    fn eval_witness_linearity() {
+        // eval_witness is linear in f: eval(a·f + b·g) = a·eval(f) + b·eval(g)  (mod q)
+        let p  = make_params(2);
+        let q  = p.q;
+        let f1 = rand_vec(p.f_dim(), q);
+        let f2 = rand_vec(p.f_dim(), q);
+        let sum: Vec1 = f1.iter().zip(&f2).map(|(&a, &b)| modq(a + b, q)).collect();
+
+        let v1  = eval_witness(&f1,  &p.x[..1], q, p.r);
+        let v2  = eval_witness(&f2,  &p.x[..1], q, p.r);
+        let vss = eval_witness(&sum, &p.x[..1], q, p.r);
+        let expected: Vec1 = v1.iter().zip(&v2).map(|(&a, &b)| modq(a + b, q)).collect();
+        assert_eq!(vss, expected, "eval_witness is not linear");
+    }
+
+    #[test]
+    fn b2_holds_at_commit() {
+        // Check that (I_{κn} ⊗ x[ℓ-1]) · v₀ = u^{(0)} as computed by commit.
+        let p   = make_params(2);
+        let f   = rand_vec(p.f_dim(), p.q);
+        let c   = commit(&p, &f);
+        let v0  = eval_witness(&f, &p.x[..p.ell - 1], p.q, p.r);
+        let xi  = vec![p.x[p.ell - 1].clone()];
+        let kx  = kron(&eye(p.kn()), &xi);
+        let u_check = mv(&kx, &v0, p.q);
+        assert_eq!(u_check, c.u, "b₂ pre-check: u mismatch at commit time");
+    }
+
+    #[test]
+    fn b2_folds_correctly() {
+        // After one fold: (I_{κn} ⊗ x[ℓ-2]) · v₁ == u^{(1)} = (C^T ⊗ I_n) · v₀
+        // This verifies the algebraic identity the protocol relies on.
+        let p    = make_params(2);
+        let q    = p.q;
+        let f    = rand_vec(p.f_dim(), q);
+        let v0   = eval_witness(&f, &p.x[..1], q, p.r); // depth 1
+
+        // Sample a challenge and fold.
+        let c_mat = sample_challenge(&p);
+        let ct    = transpose(&c_mat);
+        // u^{(1)} = (C^T ⊗ I_n) · v₀
+        let u1    = mv(&kron(&ct, &eye(p.n)), &v0, q);
+        // f^{(1)} = (C^T ⊗ I_{rn}) · f
+        let f1    = mv(&kron(&ct, &eye(p.r * p.n)), &f, q);
+        // v₁ = eval_witness(f^{(1)}, [], ..) = f^{(1)}  (depth 0)
+        let v1    = eval_witness(&f1, &[], q, p.r);
+        // Check: (I_{κn} ⊗ x[0]) · v₁ = u^{(1)}
+        let xi    = vec![p.x[0].clone()];
+        let kx    = kron(&eye(p.kn()), &xi);
+        assert_eq!(mv(&kx, &v1, q), u1, "b₂ fold invariant failed");
+    }
+
+    // ── commitment ────────────────────────────────────────────
+
+    #[test]
+    fn commit_verify_ell1() {
+        let p = make_params(1);
+        assert!(verify_commit(&p, &commit(&p, &rand_vec(p.f_dim(), p.q))));
+    }
+
+    #[test]
+    fn commit_verify_ell2() {
+        let p = make_params(2);
+        assert!(verify_commit(&p, &commit(&p, &rand_vec(p.f_dim(), p.q))));
+    }
+
+    #[test]
+    fn commit_verify_ell3() {
+        let p = make_params(3);
+        assert!(verify_commit(&p, &commit(&p, &rand_vec(p.f_dim(), p.q))));
+    }
+
+    #[test]
+    fn tampered_t_rejected() {
+        let p = make_params(2);
+        let mut c = commit(&p, &rand_vec(p.f_dim(), p.q));
+        c.t[0] = (c.t[0] + 1) % p.q;
+        assert!(!verify_commit(&p, &c));
+    }
+
+    #[test]
+    fn tampered_f_rejected() {
+        let p = make_params(2);
+        let mut c = commit(&p, &rand_vec(p.f_dim(), p.q));
+        c.f[0] = (c.f[0] + 1) % p.q;
+        assert!(!verify_commit(&p, &c));
+    }
+
+    #[test]
+    fn tampered_s0_rejected() {
+        let p = make_params(2);
+        let mut c = commit(&p, &rand_vec(p.f_dim(), p.q));
+        c.s[0][0] = (c.s[0][0] + 1) % p.q;
+        assert!(!verify_commit(&p, &c));
+    }
+
+    // ── full protocol ─────────────────────────────────────────
+
+    #[test]
+    fn protocol_honest_ell1() {
+        let p = make_params(1);
+        let c = commit(&p, &rand_vec(p.f_dim(), p.q));
+        assert!(run_protocol(&p, &c));
+    }
+
+    #[test]
+    fn protocol_honest_ell2() {
+        let p = make_params(2);
+        let c = commit(&p, &rand_vec(p.f_dim(), p.q));
+        assert!(run_protocol(&p, &c));
+    }
+
+    #[test]
+    fn protocol_honest_ell3() {
+        let p = make_params(3);
+        let c = commit(&p, &rand_vec(p.f_dim(), p.q));
+        assert!(run_protocol(&p, &c));
+    }
+
+    #[test]
+    fn protocol_tampered_t_fails() {
+        let p = make_params(2);
+        let mut c = commit(&p, &rand_vec(p.f_dim(), p.q));
+        c.t[0] = (c.t[0] + 1) % p.q;
+        assert!(!run_protocol(&p, &c));
+    }
+
+    #[test]
+    fn protocol_tampered_u_fails() {
+        let p = make_params(2);
+        let mut c = commit(&p, &rand_vec(p.f_dim(), p.q));
+        c.u[0] = (c.u[0] + 1) % p.q; // wrong evaluation claim
+        assert!(!run_protocol(&p, &c));
+    }
+
+    // ── Kronecker sanity ──────────────────────────────────────
+
+    #[test]
+    fn kron_mixed_product() {
+        let a: Mat = vec![vec![1, 2], vec![3, 4]];
+        let b: Mat = vec![vec![0, 1], vec![1, 0]];
+        let c: Mat = vec![vec![1, 0], vec![0, 1]]; // identity
+        let d: Mat = vec![vec![2, 0], vec![0, 2]]; // 2·I
+
+        let ab  = kron(&a, &b);
+        let cd  = kron(&c, &d);
+        let lhs = {
+            let (r, cc, k) = (rows(&ab), cols(&cd), cols(&ab));
+            let mut out = mat_zero(r, cc);
+            for i in 0..r { for j in 0..cc { for l in 0..k {
+                out[i][j] += ab[i][l] * cd[l][j];
+            }}}
+            out
+        };
+        // (A·I) ⊗ (B·2I) = A ⊗ 2B
+        let rhs = kron(&a, &vec![vec![0, 2], vec![2, 0]]);
+        assert_eq!(lhs, rhs);
     }
 }
